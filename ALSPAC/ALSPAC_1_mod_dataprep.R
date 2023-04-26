@@ -368,6 +368,9 @@ data_full$risk_groups = as.factor(ifelse(int==0 & fat==0, 'healthy',
                                   ifelse(int==1 & fat==1, 'comorbidity', NA)))))
 
 # ==============================================================================
+data <- data.frame(lapply(data_full , as.numeric))
+c = round(cor(data, use='pairwise.complete.obs'),2)
+
 # Save and flee
 
 # Main file

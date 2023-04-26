@@ -8,7 +8,7 @@ if(!exists('datapath')) { datapath <- dirname(file.choose()) } # volumes = X:/Ps
 
 # Load raw and imputed data 
 data <- readRDS(file.path(datapath, 'data_raw.rds'))
-imput <- readRDS(file.path(datapath, 'imp_sample_merged_220223.rds'))
+imput <- readRDS(file.path(datapath, 'imp_sample.rds'))
 
 # Set up output location and date for saving 
 descpath <- file.path(dirname(datapath),'Descriptives')
@@ -130,13 +130,14 @@ describe <- function(imput=imput) {
   # determine categorical and continuous vars 
   lvl_length <- lapply(imput$data, function(var) length(levels(as.factor(var)))) 
   # Cutoff 15 levels: consider it categorical
-  cat_vars <- names(which(lvl_length < 8))
+  cat_vars <- names(which(lvl_length < 5))
   
   # Stack imputed datasets in long format, excluding the original data
   impdat <- mice::complete(imput, action="long", include = F)
-  # Set to factors
+  # Set to factors or numeric when appropiate
   impdat[,cat_vars] <- lapply(impdat[,cat_vars] , as.factor)
   impdat = impdat[,-grep('IDC',names(impdat))]
+  impdat[, !names(impdat)%in%cat_vars] <- lapply(impdat[,!names(impdat)%in%cat_vars] , as.numeric)
   
   pool_descriptives <- function(implist, column_names, categorical=T) {
     summ <- with(implist, by(implist, .imp, function(x) summary(x[, -c(1,2)],digits=4))) 
@@ -176,7 +177,7 @@ describe <- function(imput=imput) {
   }
   
   # Correlation matrix in the imputed set
-  cors_imp <- miceadds::micombine.cor(mi.res = impdat, 
+  cors_imp <- miceadds::micombine.cor(mi.res = impdat, method='spearman',
                                       variables = colnames(impdat)[!colnames(impdat) %in% 
                                                c('.imp','.id',cat_vars)]) 
   

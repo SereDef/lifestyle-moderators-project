@@ -8,7 +8,7 @@ if(!exists('datapath')) { datapath <- dirname(file.choose()) } # volumes = X:/Ps
 
 data <- readRDS(file.path(datapath, 'GenR_data_raw.rds'))
 data <- data[,-grep('IDM',names(data))]
-imput <- readRDS(file.path(datapath, 'GenR_imp_sample_merged_220223.rds'))
+imput <- readRDS(file.path(datapath, 'imp_sample.rds'))
 
 descpath <- file.path(dirname(datapath),'Descriptives')
 
@@ -28,7 +28,7 @@ samp2 <- samp1[samp1$post_percent_missing<50,];
 cat('Excluding participants with insufficient postnatal information (<50%):\n', nrow(samp1),'-',nrow(samp1)-nrow(samp2),'=',nrow(samp2), '\n\n')
 samp3 <- samp2[samp2$twin==0,]; 
 cat('Excluding twins:\n', nrow(samp2),'-',nrow(samp2)-nrow(samp3),'=',nrow(samp3), '\n\n')
-sample <- samp3[samp3$IDC %in% impu$data$IDC,];
+sample <- samp3[samp3$IDC %in% imput$data$IDC,];
 cat('Excluding siblings:\n', nrow(samp3),'-',nrow(samp3)-nrow(sample),'=',nrow(sample),'\n\n')
 
 complete <- sample[!is.na(sample$intern_score_13) & !is.na(sample$tot_fat_percent_13),]
@@ -126,18 +126,19 @@ for (v in names(data)[-which(names(data)%in%c('IDC','IDM'))]) { summary_df = rbi
 
 # FULL AND SELECTED SAMPLE (AFTER IMPUTATION ) =================================
 
-describe <- function(imput=impu) {
+describe <- function(imput) {
   # determine categorical and continuous vars 
   lvl_length <- lapply(imput$data, function(var) length(levels(as.factor(var)))) 
   # Cutoff 15 levels: consider it categorical
-  cat_vars <- names(which(lvl_length < 15))
+  cat_vars <- names(which(lvl_length < 5))
   # correct one issue: this has too few levels 
-  cat_vars <- setdiff(cat_vars, c('post_direct_victimization','med_diet'))
+  # cat_vars <- setdiff(cat_vars, c('post_direct_victimization','mdiet'))
   
   # Stack imputed datasets in long format, excluding the original data
-  impdat <- mice::complete(impu, action="long", include = F)
-  # Set to factors
+  impdat <- mice::complete(imput, action="long", include = F)
+  # Set to factors/ numeric when appropiate 
   impdat[,cat_vars] <- lapply(impdat[,cat_vars] , as.factor)
+  impdat[, !names(impdat)%in%cat_vars] <- lapply(impdat[,!names(impdat)%in%cat_vars] , as.numeric)
   
   pool_descriptives <- function(implist, column_names, categorical=T) {
     summ <- with(implist, by(implist, .imp, function(x) summary(x[, -c(1, 2)],digits=4))) 
@@ -188,7 +189,7 @@ describe <- function(imput=impu) {
   return(stats)
 }
 
-s = describe(impu)
+s = describe(imput)
 
 
 openxlsx::write.xlsx(c(list('missing_pattern'=miss,'summary'=summary_df), s), 

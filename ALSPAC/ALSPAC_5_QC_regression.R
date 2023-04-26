@@ -10,7 +10,7 @@ if(!exists('datapath')) {
 date <- format(Sys.Date(), "%d%m%y")
 
 # Load data
-data <- complete(readRDS(file.path(datapath, 'imp_sample_merged_220223.rds')), 0)
+data <- complete(readRDS(file.path(datapath, 'imp_sample_merged_220223.rds')), 1)
 data$ELS <- rowSums(data[,c('prenatal_stress','postnatal_stress')])
 data$exercise_fac <- data$exercise
 data$exercise <- as.numeric(data$exercise)
@@ -28,6 +28,23 @@ form <- function(outc, exp, mod) {
   print(summary(fit))
   return(fit)
 }
+
+form('intern_score_13_z','prenatal_stress_z','sleep_hr')
+data <- complete(readRDS(file.path(datapath, 'imp_sample_merged_220223.rds')), 2)
+
+mod = 'med_diet'
+outc = 'intern_score_13_z'
+
+lim = range(data[,mod])
+mod.grid = seq(lim[1],lim[2])
+nd = list(mod=mod.grid); names(nd)=mod
+fit = lm(as.formula(paste0(outc,' ~ splines::ns(',mod,', 5)')), data=data)
+pred = predict(fit, newdata = nd, se=T)
+
+plot(data[,mod], data[,outc], main = 'Try')
+lines(mod.grid, pred$fit, col='blue',lwd=3)
+lines(mod.grid, pred$fit+2*pred$se.fit,lty='dashed',lwd=2)
+lines(mod.grid, pred$fit-2*pred$se.fit,lty='dashed',lwd=2)
 
 sink(file.path(dirname(datapath), paste0('ALSPAC_regress_raw_',date,'.txt')))
 

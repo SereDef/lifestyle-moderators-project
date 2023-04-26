@@ -1,5 +1,5 @@
 # Load needed packages
-pack <- c('mice','miceadds','nnet', 'openxlsx')
+pack <- c('mice','stringr','miceadds','nnet','MNLpred','openxlsx')
 invisible(lapply(pack, require, character.only = T));
 
 #Data location 
@@ -8,185 +8,409 @@ if(!exists('datapath')) { datapath <- dirname(file.choose()) } # volumes = X:/Ps
 respath <- file.path(dirname(datapath),'Results')
 date <- format(Sys.Date(), "%d%m%y")
 
-sample_imp_set <- readRDS(file.path(datapath,'GenR_imp_sample_merged_220223.rds'))
+sample_mids <- readRDS(file.path(datapath,'GenR_imp_sample_merged_220223.rds'))
 
 # ------------------------------------------------------------------------------
 
-# Add missing variables
-impdat <- complete(sample_imp_set, action="long", include = T)
-# reverse binary moderator variables
-impdat$exercise_binR <- ifelse(impdat$exercise_bin == 1, 0, 1) 
-impdat$sleep_hr_binR <- ifelse(impdat$sleep_hr_bin == 1, 0, 1)
-impdat$sleep_SR_binR <- ifelse(impdat$sleep_SR_bin == 1, 0, 1)
-impdat$med_diet_binR <- ifelse(impdat$med_diet_bin == 1, 0, 1)
-# Add total ELS score in case it's missing
-impdat$ELS <- rowSums(impdat[,c('prenatal_stress','postnatal_stress')])
-# Include a numeric version of the exercise factor, to transform into z score 
-impdat$exercise_fac <- impdat$exercise
-impdat$exercise <- as.numeric(impdat$exercise)
+# Add missing variables (reverse coded binary moderators)
+longdat <- complete(sample_mids, action="long", include = T)
 
-sample_imp_set <- as.mids(impdat); rm(impdat)
+# Simplify names 
+rep_str = c('exercise'='exerc','sleep_hr'='sleep','med_diet'='mdiet', 'sleep_SR'='SRsleep',
+            'intern_score_13'='intern', 'tot_fat_percent_13'='adipos', 'risk_groups_perc'='comorb', 
+            'pre_life_events'='pre_le', 'pre_contextual_risk'='pre_cr', 'pre_parental_risk'='pre_pr', 'pre_interpersonal_risk'='pre_ir', 
+            'post_life_events'='pos_le','post_contextual_risk'='pos_cr','post_parental_risk'='pos_pr','post_interpersonal_risk'='pos_ir', 
+            'post_direct_victimization'='pos_dv')
+names(longdat) <- stringr::str_replace_all(names(longdat), rep_str)
+
+# reverse binary moderator variables
+longdat$exerc_binR <- ifelse(longdat$exerc_bin == 1, 0, 1) 
+longdat$sleep_binR <- ifelse(longdat$sleep_bin == 1, 0, 1)
+longdat$mdiet_binR <- ifelse(longdat$mdiet_bin == 1, 0, 1)
+longdat$SRsleep_binR <- ifelse(longdat$SRsleep_bin == 1, 0, 1)
+# Include a numeric version of the exercise factor, to transform into z score 
+longdat$exerc_fac <- longdat$exerc
+longdat$exerc <- as.numeric(longdat$exerc)
+
+# Add total ELS score in case it's missing
+longdat$ELS <- rowSums(longdat[,c('prenatal_stress','postnatal_stress')])
+
+sample_mids <- as.mids(longdat)
 
 # Add standardized scores for main variables
-trans <- c('ELS','exercise','sleep_hr','sleep_SR','med_diet')
-sample_imp_set <- datlist2mids( scale_datlist( mids2datlist(sample_imp_set), 
-                                               orig_var = trans, trafo_var = paste0(trans, '_z')))
+mods = c('exerc','sleep','mdiet')
+domains <- c('pre_le','pre_cr','pre_pr','pre_ir','pos_le','pos_cr','pos_pr','pos_ir','pos_dv')
+foodgroups <- paste0('mdiet_', c('veg','leg','fru','cer','fis','mea','dai'))
 
+to_trans <- c('ELS', mods, domains, foodgroups, 'SRsleep')
+sample_mids <- datlist2mids( scale_datlist( mids2datlist(sample_mids), 
+                                            orig_var = to_trans, trafo_var = paste0(to_trans, '_z')))
+# Create total lifestyle score
+longdat <- complete(sample_mids,'long', include=T)
+longdat$lifes <- rowSums(longdat[, paste0(mods,'_z')])
+sample_mids <- as.mids(longdat)
+
+# Save finished mids 
+saveRDS(sample_mids, file.path(datapath,'imp_sample.rds'))
 # Save each imputed setfor portenial plottining
-for (m in 0:30) { write.csv(complete(sample_imp_set,m), file.path(datapath,'byimp',paste0('imp',m,'.csv'))) }
+for (m in 0:30) { write.csv(complete(sample_mids, m), file.path(datapath,'byimp',paste0('imp',m,'.csv'))) }
 
 # ------------------------------------------------------------------------------
 
-pool_fit <- function(modr, outc='risk_groups_perc', exp='ELS_z') {
+pool_fit <- function(mods=c('exerc','sleep','mdiet','SRsleep'), z_or_bin='_z', interact='*',
+                     outc='comorb', exp='ELS_z') {
+  cat(outc, '\n')
   # Define covariates
   covs <- '+ age_child + sex + ethnicity + m_bmi_before_pregnancy + m_smoking + m_drinking'
-  # Define outcome recoding status for model name
-  # rec <- ifelse(outc=='risk_groups_perc', 'H', 'M') # assign(paste('base',name,rec,'ref',sep='_'), 
-  # IF risk outcome fit a multimod model else lm
-  if (startsWith(outc, 'risk')) {
-    fit <- with(sample_imp_set, nnet::multinom(as.formula(paste(outc,'~',exp,modr,covs)), model = T));
-  } else { 
-    fit <- with(sample_imp_set, lm(as.formula(paste(outc,'~',exp,modr,covs)))); 
-  }
-  p_fit <- mice::pool(fit) # pool results 
-  mod <- summary(p_fit) # extract relevant information
-  mod[,-c(1,2)] <- round(mod[,-c(1,2)],4)
-  mod$sign <- ifelse(mod$p.value < 0.05, '*', '') # add a column to highlight significant terms
+  # Initiate stack
+  models = data.frame()
   
-  if (startsWith(outc, 'risk')) {
-    # make group comparisons easier to read
-    if (endsWith(outc, 'REC')) { 
-      levels(mod$y.level) <- c("M:healthy","M:intern", "M:fatmas")
-    } else { levels(mod$y.level) <- c("H:intern", "H:fatmas", "H:multim") }
-    mod$OR  <- round(exp(mod$estimate), 4)
-    mod$lci <- round(exp((mod$estimate) - 1.96*mod$std.error), 4)
-    mod$uci <- round(exp((mod$estimate) + 1.96*mod$std.error), 4)
-    mod$AIC <- c(mean(p_fit$glanced$AIC), rep(NA, nrow(mod)-1)) # add a column for AIC
-  } else {
-    mod$lci <- round((mod$estimate - 1.96*mod$std.error), 4)
-    mod$uci <- round((mod$estimate + 1.96*mod$std.error), 4)
-    mod$rsq <- c(pool.r.squared(fit)[1], rep(NA, nrow(mod)-1)) # add a column for R2
-    mod$rsq_adj <- c(pool.r.squared(fit, adjusted = TRUE)[1], rep(NA, nrow(mod)-1)) # adjusted R2
+  for (modr in paste0(mods,z_or_bin)) {
+    # IF outcome is comorbidity group fit a multimod model else lm
+    if (startsWith(outc, 'comorb')) { 
+      fit <- with(sample_mids, nnet::multinom(as.formula(paste(outc,'~',exp, interact, modr, covs)), 
+                                              model=T, trace=F));
+    } else { 
+      fit <- with(sample_mids, lm(as.formula(paste(outc,'~',exp, interact, modr, covs)))); }
+    
+    p_fit <- mice::pool(fit) # pool results 
+    mod <- summary(p_fit) # extract relevant information
+    mod[,-c(1,2)] <- round(mod[,-c(1,2)],4)
+    mod$sign <- ifelse(mod$p.value < 0.05, '*', '') # add a column to highlight significant terms
+    
+    cat('--------', as.character(mod[nrow(mod),'term']), '--> p =', round(mod$p.value[nrow(mod)], 3), '\n')
+    
+    if (startsWith(outc, 'comorb')) {
+      # make group comparisons easier to read
+      if (endsWith(outc, 'REC')) { levels(mod$y.level) <- c("C:healthy","C:intern", "C:adipos")
+      } else { levels(mod$y.level) <- c("H:intern", "H:adipos", "H:comorb") }
+      mod$OR  <- round(exp(mod$estimate), 4)
+      mod$lci <- round(exp((mod$estimate) - 1.96*mod$std.error), 4)
+      mod$uci <- round(exp((mod$estimate) + 1.96*mod$std.error), 4)
+      mod$AIC <- c(mean(p_fit$glanced$AIC), rep(NA, nrow(mod)-1)) # add a column for AIC
+    } else {
+      mod$lci <- round((mod$estimate - 1.96*mod$std.error), 4)
+      mod$uci <- round((mod$estimate + 1.96*mod$std.error), 4)
+      mod$rsq <- round(c(pool.r.squared(fit)[1], rep(NA, nrow(mod)-1)),4) # add a column for R2
+      mod$rsq_adj <- round(c(pool.r.squared(fit, adjusted = TRUE)[1], rep(NA, nrow(mod)-1)),4) # adjusted R2
+    }
+    mod <- cbind(rep(modr, nrow(mod)),mod)
+    
+    models <- rbind(models, mod, rep(NA, ncol(mod)))
   }
-  # print(mod)
-  return(mod)
+  names(models)[1] = 'model' # print(mod)
+  return(models)
 }
 # ------------------------------------------------------------------------------
+sink(file.path(respath,'summary_int_pvals.txt'))
+# Baseline analyses (comorbidity [vs. healthy], internalizing and adiposity)
+els_com <- pool_fit()
+els_int <- pool_fit(outc='intern_z')
+els_fat <- pool_fit(outc='adipos_z')
 
-# baseline analyses with healthy as the reference group
-exerc_main <- pool_fit('* exercise_z')
-sleep_main <- pool_fit('* sleep_hr_z'); sleepSR_main <- pool_fit('* sleep_SR_z');  
-mdiet_main <- pool_fit('* med_diet_z')
+# prenatal and postnatal exposure assessment
+pre_com <- pool_fit(exp='prenatal_stress_z')
+pre_int <- pool_fit(exp='prenatal_stress_z', outc='intern_z')
+pre_fat <- pool_fit(exp='prenatal_stress_z', outc='adipos_z')
+pos_com <- pool_fit(exp='postnatal_stress_z')
+pos_int <- pool_fit(exp='postnatal_stress_z', outc='intern_z')
+pos_fat <- pool_fit(exp='postnatal_stress_z', outc='adipos_z')
 
-# binary moderator analyses with healthy as the reference group
-exerc_bin1 <- pool_fit('* exercise_bin')
-sleep_bin1 <- pool_fit('* sleep_hr_bin'); sleepSR_bin1 <- pool_fit('* sleep_SR_bin')
-mdiet_bin1 <- pool_fit('* med_diet_bin')
-# reversed binary moderator analyses with healthy as the reference group
-exerc_bin2 <- pool_fit('* exercise_binR')
-sleep_bin2 <- pool_fit('* sleep_hr_binR'); sleepSR_bin2 <- pool_fit('* sleep_SR_binR')
-mdiet_bin2 <- pool_fit('* med_diet_binR')
+# EXTRA ------------------------------------------------------------------------
 
-# baseline analyses with comorbid as the reference group
-exerc_comR <- pool_fit('* exercise_z', outc='risk_groups_perc_REC')
-sleep_comR <- pool_fit('* sleep_hr_z', outc='risk_groups_perc_REC'); sleepSR_comR <- pool_fit('* sleep_SR_z', outc='risk_groups_perc_REC')
-mdiet_comR <- pool_fit('* med_diet_z', outc='risk_groups_perc_REC')
+# Total lifestyle score 
+ls_els_com <- pool_fit(mods=c('lifes'), z_or_bin='')
+ls_els_int <- pool_fit(mods=c('lifes'), z_or_bin='', outc='intern_z')
+ls_els_fat <- pool_fit(mods=c('lifes'), z_or_bin='', outc='adipos_z')
 
-# prenatal exposure assessment
-exerc_pren <- pool_fit('* exercise_z', exp='prenatal_stress_z')
-sleep_pren <- pool_fit('* sleep_hr_z', exp='prenatal_stress_z'); sleepSR_pren <- pool_fit('* sleep_SR_z', exp='prenatal_stress_z')
-mdiet_pren <- pool_fit('* med_diet_z', exp='prenatal_stress_z')
-# postnatal exposure assessment
-exerc_post <- pool_fit('* exercise_z', exp='postnatal_stress_z')
-sleep_post <- pool_fit('* sleep_hr_z', exp='postnatal_stress_z'); sleepSR_post <- pool_fit('* sleep_SR_z', exp='postnatal_stress_z')
-mdiet_post <- pool_fit('* med_diet_z', exp='postnatal_stress_z')
+ls_pre_com <- pool_fit(mods=c('lifes'), z_or_bin='', exp='prenatal_stress_z')
+ls_pre_int <- pool_fit(mods=c('lifes'), z_or_bin='', exp='prenatal_stress_z', outc='intern_z')
+ls_pre_fat <- pool_fit(mods=c('lifes'), z_or_bin='', exp='prenatal_stress_z', outc='adipos_z')
+ls_pos_com <- pool_fit(mods=c('lifes'), z_or_bin='', exp='postnatal_stress_z')
+ls_pos_int <- pool_fit(mods=c('lifes'), z_or_bin='', exp='postnatal_stress_z', outc='intern_z')
+ls_pos_fat <- pool_fit(mods=c('lifes'), z_or_bin='', exp='postnatal_stress_z', outc='adipos_z')
 
-# Internalizing outcome
-exerc_intr <- pool_fit('* exercise_z', outc='intern_score_13_z')
-sleep_intr <- pool_fit('* sleep_hr_z', outc='intern_score_13_z'); sleepSR_intr <- pool_fit('* sleep_SR_z', outc='intern_score_13_z')
-mdiet_intr <- pool_fit('* med_diet_z', outc='intern_score_13_z')
-# Fat mass outcome 
-exerc_fatm <- pool_fit('* exercise_z', outc='tot_fat_percent_13_z')
-sleep_fatm <- pool_fit('* sleep_hr_z', outc='tot_fat_percent_13_z'); sleepSR_fatm <- pool_fit('* sleep_SR_z', outc='tot_fat_percent_13_z')
-mdiet_fatm <- pool_fit('* med_diet_z', outc='tot_fat_percent_13_z')
+# Individual stress domains 
+for (d in domains) {
+  assign(paste0(d,'_com'), pool_fit(exp=paste0(d,'_z')))
+  assign(paste0(d,'_int'), pool_fit(exp=paste0(d,'_z'), outc='intern_z'))
+  assign(paste0(d,'_fat'), pool_fit(exp=paste0(d,'_z'), outc='adipos_z'))
+  assign(paste0('ls_',d,'_com'), pool_fit(exp=paste0(d,'_z'), mods=c('lifes'), z_or_bin=''))
+  assign(paste0('ls_',d,'_int'), pool_fit(exp=paste0(d,'_z'), mods=c('lifes'), z_or_bin='', outc='intern_z'))
+  assign(paste0('ls_',d,'_fat'), pool_fit(exp=paste0(d,'_z'), mods=c('lifes'), z_or_bin='', outc='adipos_z'))
+}
 
-# Internalizing outcome binary moderator 
-exerc_intr_bin1 <- pool_fit('* exercise_bin', outc='intern_score_13_z')
-sleep_intr_bin1 <- pool_fit('* sleep_hr_bin', outc='intern_score_13_z')
-mdiet_intr_bin1 <- pool_fit('* med_diet_bin', outc='intern_score_13_z')
-# Internalizing outcome reversed binary moderator
-exerc_intr_bin2 <- pool_fit('* exercise_binR', outc='intern_score_13_z')
-sleep_intr_bin2 <- pool_fit('* sleep_hr_binR', outc='intern_score_13_z')
-mdiet_intr_bin2 <- pool_fit('* med_diet_binR', outc='intern_score_13_z')
+# Food groups
+fg_els_com <- pool_fit(mods=foodgroups)
+fg_els_int <- pool_fit(mods=foodgroups, outc='intern_z')
+fg_els_fat <- pool_fit(mods=foodgroups, outc='adipos_z')
 
-# Fat mass outcome binary moderator 
-exerc_fatm_bin1 <- pool_fit('* exercise_bin', outc='tot_fat_percent_13_z')
-sleep_fatm_bin1 <- pool_fit('* sleep_hr_bin', outc='tot_fat_percent_13_z')
-mdiet_fatm_bin1 <- pool_fit('* med_diet_bin', outc='tot_fat_percent_13_z')
-# Fat mass outcome reversed binary moderator
-exerc_fatm_bin2 <- pool_fit('* exercise_binR', outc='tot_fat_percent_13_z')
-sleep_fatm_bin2 <- pool_fit('* sleep_hr_binR', outc='tot_fat_percent_13_z')
-mdiet_fatm_bin2 <- pool_fit('* med_diet_binR', outc='tot_fat_percent_13_z')
+# comorbid as the reference group
+els_comR <- pool_fit(outc='comorb_REC')
 
-# Internalizing outcome - prenatal stress
-exerc_intr_pren <- pool_fit('* exercise_z', outc='intern_score_13_z',exp='prenatal_stress_z')
-sleep_intr_pren <- pool_fit('* sleep_hr_z', outc='intern_score_13_z',exp='prenatal_stress_z')
-mdiet_intr_pren <- pool_fit('* med_diet_z', outc='intern_score_13_z',exp='prenatal_stress_z')
-# Fat mass outcome - prenatal stress
-exerc_fatm_pren <- pool_fit('* exercise_z', outc='tot_fat_percent_13_z',exp='prenatal_stress_z')
-sleep_fatm_pren <- pool_fit('* sleep_hr_z', outc='tot_fat_percent_13_z',exp='prenatal_stress_z')
-mdiet_fatm_pren <- pool_fit('* med_diet_z', outc='tot_fat_percent_13_z',exp='prenatal_stress_z')
+# Binary moderator (comorbidity [vs. healthy], internalizing and adiposity)
+b1_els_com <- pool_fit(z_or_bin='_bin')
+b1_els_int <- pool_fit(z_or_bin='_bin', outc='intern_z')
+b1_els_fat <- pool_fit(z_or_bin='_bin', outc='adipos_z')
+b2_els_com <- pool_fit(z_or_bin='_binR') # reversed binary moderator
+b2_els_int <- pool_fit(z_or_bin='_binR',outc='intern_z')
+b2_els_fat <- pool_fit(z_or_bin='_binR',outc='adipos_z')
 
-# Internalizing outcome - postatal stress
-exerc_intr_post <- pool_fit('* exercise_z', outc='intern_score_13_z',exp='postnatal_stress_z')
-sleep_intr_post <- pool_fit('* sleep_hr_z', outc='intern_score_13_z',exp='postnatal_stress_z')
-mdiet_intr_post <- pool_fit('* med_diet_z', outc='intern_score_13_z',exp='postnatal_stress_z')
-# Fat mass outcome - postatal stress
-exerc_fatm_post <- pool_fit('* exercise_z', outc='tot_fat_percent_13_z',exp='postnatal_stress_z')
-sleep_fatm_post <- pool_fit('* sleep_hr_z', outc='tot_fat_percent_13_z',exp='postnatal_stress_z')
-mdiet_fatm_post <- pool_fit('* med_diet_z', outc='tot_fat_percent_13_z',exp='postnatal_stress_z')
+sink()
 
 # No interaction models 
-exerc_noin <- pool_fit('+ exercise_z')
-sleep_noin <- pool_fit('+ sleep_hr_z'); sleepSR_noin <- pool_fit('+ sleep_SR_z')
-mdiet_noin <- pool_fit('+ med_diet_z')
+ad_els_com <- pool_fit(interact='+')
+ad_els_int <- pool_fit(interact='+', outc='intern_z')
+ad_els_fat <- pool_fit(interact='+', outc='adipos_z')
+
 
 # ------------------------------------------------------------------------------
-# ls()[grepl('exerc|sleep|mdiet', ls())]
-# for (m in c('main','bin1','bin2','intr','fatm','pren','post','comR','noin')) {
-#   names = paste(c('exerc','sleep','mdiet'), m, sep="_")
-#   for (n in names) { cat("'",n,"'= ",n,", ", sep='')}
-# }
+# names = ls()[grepl('int|fat|com', ls())]
+# for (n in names) { cat("'",n,"'= ",n,", ", sep='')}
 
-modls <- list(
-'exerc_main'= exerc_main, 'sleep_main'= sleep_main, 'mdiet_main'= mdiet_main, 
-'exerc_bin1'= exerc_bin1, 'sleep_bin1'= sleep_bin1, 'mdiet_bin1'= mdiet_bin1, 
-'exerc_bin2'= exerc_bin2, 'sleep_bin2'= sleep_bin2, 'mdiet_bin2'= mdiet_bin2, 
-'exerc_intr'= exerc_intr, 'sleep_intr'= sleep_intr, 'mdiet_intr'= mdiet_intr, 
-'exerc_fatm'= exerc_fatm, 'sleep_fatm'= sleep_fatm, 'mdiet_fatm'= mdiet_fatm, 
-'exerc_pren'= exerc_pren, 'sleep_pren'= sleep_pren, 'mdiet_pren'= mdiet_pren, 
-'exerc_post'= exerc_post, 'sleep_post'= sleep_post, 'mdiet_post'= mdiet_post, 
-'exerc_comR'= exerc_comR, 'sleep_comR'= sleep_comR, 'mdiet_comR'= mdiet_comR, 
-'exerc_noin'= exerc_noin, 'sleep_noin'= sleep_noin, 'mdiet_noin'= mdiet_noin,
-'exerc_intr_bin1'= exerc_intr_bin1, 'sleep_intr_bin1'= sleep_intr_bin1, 'mdiet_intr_bin1'= mdiet_intr_bin1, 
-'exerc_intr_bin2'= exerc_intr_bin2, 'sleep_intr_bin2'= sleep_intr_bin2, 'mdiet_intr_bin2'= mdiet_intr_bin2, 
-'exerc_fatm_bin1'= exerc_fatm_bin1, 'sleep_fatm_bin1'= sleep_fatm_bin1, 'mdiet_fatm_bin1'= mdiet_fatm_bin1, 
-'exerc_fatm_bin2'= exerc_fatm_bin2, 'sleep_fatm_bin2'= sleep_fatm_bin2, 'mdiet_fatm_bin2'= mdiet_fatm_bin2, 
-'exerc_intr_pren'= exerc_intr_pren, 'sleep_intr_pren'= sleep_intr_pren, 'mdiet_intr_pren'= mdiet_intr_pren, 
-'exerc_intr_post'= exerc_intr_post, 'sleep_intr_post'= sleep_intr_post, 'mdiet_intr_post'= mdiet_intr_post,
-'exerc_fatm_pren'= exerc_fatm_pren, 'sleep_fatm_pren'= sleep_fatm_pren, 'mdiet_fatm_pren'= mdiet_fatm_pren, 
-'exerc_fatm_post'= exerc_fatm_post, 'sleep_fatm_post'= sleep_fatm_post, 'mdiet_fatm_post'= mdiet_fatm_post,
-'sleepSR_main'= sleepSR_main, 
-'sleepSR_bin1'= sleepSR_bin1, 
-'sleepSR_bin2'= sleepSR_bin2, 
-'sleepSR_intr'= sleepSR_intr, 
-'sleepSR_fatm'= sleepSR_fatm, 
-'sleepSR_pren'= sleepSR_pren, 
-'sleepSR_post'= sleepSR_post, 
-'sleepSR_comR'= sleepSR_comR, 
-'sleepSR_noin'= sleepSR_noin)
+modls <- list('els_com'= els_com, 'els_fat'= els_fat, 'els_int'= els_int, 
+              'pre_com'= pre_com, 'pre_fat'= pre_fat, 'pre_int'= pre_int, 
+              'pos_com'= pos_com, 'pos_fat'= pos_fat, 'pos_int'= pos_int, 
+              
+              'b1_els_com'= b1_els_com, 'b1_els_fat'= b1_els_fat, 'b1_els_int'= b1_els_int, 
+              'b2_els_com'= b2_els_com, 'b2_els_fat'= b2_els_fat, 'b2_els_int'= b2_els_int, 
+              
+              'els_comR'= els_comR,
+              
+              'ad_els_com'= ad_els_com, 'ad_els_fat'= ad_els_fat, 'ad_els_int'= ad_els_int)
 
-respath <- '~/Desktop/Bath_visit/Results'
 openxlsx::write.xlsx(modls, file = file.path(respath, paste0('GENR_Results_',date,'.xlsx')), 
                      overwrite=T)
+# ------------------------------------------------------------------------------
+# names = ls()[grepl('_com|_int|_fat', ls())]
+# for (n in names) { cat("'",n,"'= ",n,",\n", sep='')}
+suppl <- list(
+  'ls_els_com'= ls_els_com, 'ls_els_fat'= ls_els_fat, 'ls_els_int'= ls_els_int,
+  'ls_pre_com'= ls_pre_com, 'ls_pre_fat'= ls_pre_fat, 'ls_pre_int'= ls_pre_int, 
+  'ls_pos_com'= ls_pos_com, 'ls_pos_fat'= ls_pos_fat, 'ls_pos_int'= ls_pos_int,
+  
+  'pre_le_com'= pre_le_com, 'pre_le_fat'= pre_le_fat, 'pre_le_int'= pre_le_int, 
+  'pre_cr_com'= pre_cr_com, 'pre_cr_fat'= pre_cr_fat, 'pre_cr_int'= pre_cr_int,
+  'pre_pr_com'= pre_pr_com, 'pre_pr_fat'= pre_pr_fat, 'pre_pr_int'= pre_pr_int,
+  'pre_ir_com'= pre_ir_com, 'pre_ir_fat'= pre_ir_fat, 'pre_ir_int'= pre_ir_int, 
+  'pos_le_com'= pos_le_com, 'pos_le_fat'= pos_le_fat, 'pos_le_int'= pos_le_int, 
+  'pos_cr_com'= pos_cr_com, 'pos_cr_fat'= pos_cr_fat, 'pos_cr_int'= pos_cr_int,
+  'pos_pr_com'= pos_pr_com, 'pos_pr_fat'= pos_pr_fat, 'pos_pr_int'= pos_pr_int, 
+  'pos_ir_com'= pos_ir_com, 'pos_ir_fat'= pos_ir_fat, 'pos_ir_int'= pos_ir_int, 
+  'pos_dv_com'= pos_dv_com, 'pos_dv_fat'= pos_dv_fat, 'pos_dv_int'= pos_dv_int, 
+  
+  'ls_pre_le_com'= ls_pre_le_com, 'ls_pre_le_fat'= ls_pre_le_fat, 'ls_pre_le_int'= ls_pre_le_int, 
+  'ls_pre_cr_com'= ls_pre_cr_com, 'ls_pre_cr_fat'= ls_pre_cr_fat, 'ls_pre_cr_int'= ls_pre_cr_int, 
+  'ls_pre_pr_com'= ls_pre_pr_com, 'ls_pre_pr_fat'= ls_pre_pr_fat, 'ls_pre_pr_int'= ls_pre_pr_int, 
+  'ls_pre_ir_com'= ls_pre_ir_com, 'ls_pre_ir_fat'= ls_pre_ir_fat, 'ls_pre_ir_int'= ls_pre_ir_int,
+  'ls_pos_le_com'= ls_pos_le_com, 'ls_pos_le_fat'= ls_pos_le_fat, 'ls_pos_le_int'= ls_pos_le_int, 
+  'ls_pos_cr_com'= ls_pos_cr_com, 'ls_pos_cr_fat'= ls_pos_cr_fat, 'ls_pos_cr_int'= ls_pos_cr_int, 
+  'ls_pos_pr_com'= ls_pos_pr_com, 'ls_pos_pr_fat'= ls_pos_pr_fat, 'ls_pos_pr_int'= ls_pos_pr_int,
+  'ls_pos_ir_com'= ls_pos_ir_com, 'ls_pos_ir_fat'= ls_pos_ir_fat, 'ls_pos_ir_int'= ls_pos_ir_int, 
+  'ls_pos_dv_com'= ls_pos_dv_com, 'ls_pos_dv_fat'= ls_pos_dv_fat, 'ls_pos_dv_int'= ls_pos_dv_int, 
+  
+  'fg_els_com'= fg_els_com, 'fg_els_fat'= fg_els_fat, 'fg_els_int'= fg_els_int)
+
+openxlsx::write.xlsx(suppl, file = file.path(respath, paste0('GENR_SupplementaryResults_',date,'.xlsx')), 
+                     overwrite=T)
+
+# ------------------------------------------------------------------------------
+# NON-LINEARITY ----------------------------------------------------------------
+# ------------------------------------------------------------------------------
+fit_spline <- function(outc) {
+  # Initiate 
+  spl_list <- list()
+  for (mod in c('exerc','sleep','mdiet')) {
+    # Data placeholder
+    d = complete(sample_mids, 1)
+    # Create grid (min to max)
+    lim = range(d[,mod])
+    mod.grid = seq(lim[1], lim[2])
+    nd = list(mod.grid); names(nd) = mod
+    # Initiate plot
+    plot(d[,mod], d[,outc], main = 'Splines', xlab=mod, ylab=outc)
+    
+    # Initiate dataframe
+    spl <- data.frame(row.names = mod.grid)
+    
+    for (i in 1:30) { 
+      imp_i <- complete(sample_mids, i)
+      c
+      pred = predict(fit, newdata = nd, se=T)
+      spl <- cbind(spl, pred$fit)
+      lines(mod.grid, pred$fit, col='blue',lwd=1)
+      # lines(mod.grid, pred$fit+2*pred$se.fit,lty='dashed',lwd=2)
+      # lines(mod.grid, pred$fit-2*pred$se.fit,lty='dashed',lwd=2)
+    }
+    spl_list[[paste0(substr(outc,1,6),'_',mod)]] <- spl
+  }
+  return(spl_list)
+}
+
+nln_int = fit_spline('intern_z')
+nln_fat = fit_spline('adipos_z')
+
+openxlsx::write.xlsx(c(nln_int, nln_fat), 
+                     file = file.path(respath, paste0('GENR_splines_',date,'.xlsx')), 
+                     overwrite=T)
+
+# Comorbidity outcome ----------------------------------------------------------
+
+covs <- '+ age_child + m_bmi_before_pregnancy + m_smoking + m_drinking' # + sex + ethnicity (factors)
+
+for (mod in c('exerc','sleep','mdiet')) {
+  for (exp in c('ELS_z','prenatal_stress_z','postnatal_stress_z')) {
+    # Determine output name and initiate 
+    out_name = paste0(substr(exp,1,3),'_',mod,'_pps')
+    probpred <- data.frame()
+    # loop through imputed datasets 
+    for (i in 1:30) {
+      message('==== ', mod, ' * ', exp,' ==== imp: ', i,' ====================================')
+      imp_i = complete(sample_mids, i)
+      fit = nnet::multinom(as.formula(paste0('comorb ~',exp,'*',mod,covs)), data=imp_i, Hess=T, 
+                           model=T,trace=F)
+      
+      lim = range(imp_i[,mod], na.rm=T)
+      mod.grid = seq(round(lim[1]), round(lim[2]), 2)
+      # loop through moderator levels 
+      for (l in mod.grid) {
+        pred <- MNLpred::mnl_fd_ova(model = fit, data = imp_i,
+                                    x = exp,
+                                    by = 0.5,
+                                    z = mod,
+                                    z_values=c(l,l+1),
+                                    seed = 310896, # default
+                                    nsim = 1000) # faster
+        # Only keep comorbid 
+        pps <- pred$plotdata[pred$plotdata$comorb=='multimorbid',]
+        pps$.imp <- i
+        probpred <- rbind(probpred, pps)
+      }
+    }
+    # Average across imputations 
+    output = probpred[probpred$.imp==1, c(exp,'comorb',mod)]
+    impmean = impmin = impmax = rep(0, nrow(output))
+    for (i in 1:30){
+      impres = probpred[probpred$.imp==i, c('mean','lower','upper')]
+      impmean = impmean + impres[,'mean']
+      impmin =  impmin +  impres[,'lower']
+      impmax =  impmax +  impres[,'upper']
+    }
+    output$mean = impmean/30
+    output$lower = impmin/30
+    output$upper = impmax/30
+    
+    assign(out_name, output)
+  }
+} 
+
+# names = ls()[grepl('_pps', ls())]
+# for (n in names) { cat("'",n,"'= ",n,", ", sep='')}
+
+pps <- list('els_exerc_pps'= ELS_exerc_pps, 'els_mdiet_pps'= ELS_mdiet_pps, 'els_sleep_pps'= ELS_sleep_pps, 
+            'pos_exerc_pps'= pos_exerc_pps, 'pos_mdiet_pps'= pos_mdiet_pps, 'pos_sleep_pps'= pos_sleep_pps, 
+            'pre_exerc_pps'= pre_exerc_pps, 'pre_mdiet_pps'= pre_mdiet_pps, 'pre_sleep_pps'= pre_sleep_pps)
+
+pps <- list('els_exerc_pps'= ELS_exerc_pps, 'pos_exerc_pps'= pos_exerc_pps, 'pre_exerc_pps'= pre_exerc_pps)
+openxlsx::write.xlsx(pps,
+                     file = file.path('~/Desktop', paste0('ALSP_predprobs.xlsx')), 
+                     overwrite=T)
+# ========================================
+library(reghelper)
+
+covs <- '+ sex + ethnicity + age_child + m_bmi_before_pregnancy + m_smoking + m_drinking' 
+
+for (mod in c('exerc','sleep','mdiet')) {
+  for (out in c('intern_z','adipos_z')) { 
+    exp='ELS_z' # 'prenatal_stress_z','postnatal_stress_z'
+    # Determine output name and initiate 
+    out_name = paste0(substr(out,1,3),'_',mod,'_ssl')
+    simplesl <- list()
+    # loop through imputed datasets 
+    for (i in 1:30) {
+      message('==== ', mod, ' * ', exp,' ==== imp: ', i,' ====================================')
+      imp_i = complete(sample_mids, i)
+      imp_i$sleep = round(imp_i$sleep)
+      
+      fit = lm(as.formula(paste0(out, '~',exp,'*',mod,covs)), data=imp_i)
+      
+      lvls = list(levels(as.factor(imp_i[,mod])))
+      names(lvls) = mod
+      ssl = reghelper::simple_slopes(fit, confint=T, levels=lvls)
+      
+      ssl$.imp <- i
+      simplesl[[i]] <- sapply( ssl[, -1], as.numeric )
+    }
+    # Average across imputations 
+    add <- function(x) Reduce("+", x)
+    
+    output = data.frame(round(add(simplesl)/30, 4))
+    
+    names(output) = c(mod, 'mean','se','lower','upper','t','df','P')
+    
+    assign(out_name, output[, -ncol(output)]) 
+  }
+}
+
+names = ls()[grepl('_ssl', ls())]
+for (n in names) { cat("'",n,"'= ",n,", ", sep='')}
+
+ssls <- list('adi_exerc_ssl'= adi_exerc_ssl, 'adi_mdiet_ssl'= adi_mdiet_ssl, 'adi_sleep_ssl'= adi_sleep_ssl, 
+             'int_exerc_ssl'= int_exerc_ssl, 'int_mdiet_ssl'= int_mdiet_ssl, 'int_sleep_ssl'= int_sleep_ssl)
+openxlsx::write.xlsx(ssls,
+                     file = file.path(respath, paste0('GENR_simpslopes_',date,'.xlsx')), 
+                     overwrite=T)
+# ===========
+
+outc_sample <- mice::filter(sample_mids, !is.na(sample_mids$data$comorb))
+
+# mods_sample <-  mice::filter(outc_sample, 
+              # !is.na(outc_sample$data$exerc)&!is.na(outc_sample$data$sleep)&!is.na(outc_sample$data$mdiet))
+dim(outc_sample$data)
+summary(outc_sample$data[,c('exerc','sleep','mdiet')])
+
+pool_fit <- function(mods=c('exerc','sleep','mdiet'), z_or_bin='_z', interact='*',
+                     outc='comorb', exp='ELS_z') {
+  # Define covariates
+  covs <- '+ age_child + sex + ethnicity + m_bmi_before_pregnancy + m_smoking + m_drinking'
+  # Initiate stack
+  models = data.frame()
+  
+  for (modr in paste0(mods,z_or_bin)) {
+    # IF outcome is comorbidity group fit a multimod model else lm
+    if (startsWith(outc, 'comorb')) { 
+      fit <- with(sample_mids, nnet::multinom(as.formula(paste(outc,'~',exp, interact, modr, covs)), 
+                                              model=T, trace=F));
+    } else { 
+      fit <- with(sample_mids, lm(as.formula(paste(outc,'~',exp, interact, modr, covs)))); }
+    
+    p_fit <- mice::pool(fit) # pool results 
+    mod <- summary(p_fit) # extract relevant information
+    mod[,-c(1,2)] <- round(mod[,-c(1,2)],4)
+    mod$sign <- ifelse(mod$p.value < 0.05, '*', '') # add a column to highlight significant terms
+    
+    cat('--------', as.character(mod[nrow(mod),'term']), '--> p =', round(mod$p.value[nrow(mod)], 3), '\n')
+    
+    if (startsWith(outc, 'comorb')) {
+      # make group comparisons easier to read
+      if (endsWith(outc, 'REC')) { levels(mod$y.level) <- c("C:healthy","C:intern", "C:adipos")
+      } else { levels(mod$y.level) <- c("H:intern", "H:adipos", "H:comorb") }
+      mod$OR  <- round(exp(mod$estimate), 4)
+      mod$lci <- round(exp((mod$estimate) - 1.96*mod$std.error), 4)
+      mod$uci <- round(exp((mod$estimate) + 1.96*mod$std.error), 4)
+      mod$AIC <- c(mean(p_fit$glanced$AIC), rep(NA, nrow(mod)-1)) # add a column for AIC
+    } else {
+      mod$lci <- round((mod$estimate - 1.96*mod$std.error), 4)
+      mod$uci <- round((mod$estimate + 1.96*mod$std.error), 4)
+      mod$rsq <- round(c(pool.r.squared(fit)[1], rep(NA, nrow(mod)-1)),4) # add a column for R2
+      mod$rsq_adj <- round(c(pool.r.squared(fit, adjusted = TRUE)[1], rep(NA, nrow(mod)-1)),4) # adjusted R2
+    }
+    mod <- cbind(rep(modr, nrow(mod)),mod)
+    
+    models <- rbind(models, mod, rep(NA, ncol(mod)))
+  }
+  names(models)[1] = 'model' # print(mod)
+  return(models)
+}
+
 
